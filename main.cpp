@@ -348,6 +348,83 @@ int calc_feature_minzoom(struct index *ix, struct drop_state *ds, int maxzoom, d
 	return feature_minzoom;
 }
 
+static void calc_feature_minzoom_with_priority(std::vector<struct index> &features, int maxzoom, double gamma, struct drop_state *ds) {
+	for(int z = 0; z < maxzoom; z++) {
+		size_t min_interval = std::max(static_cast<size_t>(ds[z].interval), static_cast<size_t>(1));
+		if (features.size() < min_interval) {
+			continue;
+		}
+		for(size_t start=0; start < features.size(); start+=min_interval) {
+			size_t best_index = -1;
+			float best_priority = -1;
+			size_t end = std::min(start + min_interval, features.size());
+			for(size_t i = start; i < end; i++) {
+				struct index &ix = features[i];
+				if (ix.minzoom != maxzoom) {
+					continue;
+				}
+				if(ix.priority > best_priority) {
+					best_priority = ix.priority;
+					best_index = i;
+				}
+			}
+			features[best_index].minzoom = z;
+		}
+	}
+}
+
+static void merge_with_priority(struct mergelist *merges, size_t nmerges, unsigned char *map, FILE *indexfile, int bytes, char *geom_map, FILE *geom_out, std::atomic<long long> *geompos, long long *progress, long long *progress_max, long long *progress_reported, int maxzoom, double gamma, struct drop_state *ds) {
+	struct mergelist *head = NULL;
+	std::size_t feature_count = 0;
+	for (size_t i = 0; i < nmerges; i++) {
+		if (merges[i].start < merges[i].end) {
+			std::size_t feature_count_for_merge_list = (merges[i].end - merges[i].start)/bytes;
+			feature_count += feature_count_for_merge_list;
+			insert(&(merges[i]), &head, map);
+		}
+	}
+
+	std::vector<struct index> features;
+	features.reserve(feature_count);
+	
+	while (head != NULL) {
+		struct index ix = *((struct index *) (map + head->start));
+		ix.minzoom = maxzoom;
+		features.push_back(ix);
+		head->start += bytes;
+		
+		struct mergelist *m = head;
+		head = m->next;
+		m->next = NULL;
+
+		if (m->start < m->end) {
+			insert(m, &head, map);
+		}
+	}
+
+	calc_feature_minzoom_with_priority(features, maxzoom, gamma, ds);
+	// loop through every features and write them to the output file
+	for(size_t i = 0; i < features.size(); i++) {
+		struct index &ix = features[i];
+		long long pos = *geompos;
+
+		fwrite_check(geom_map + ix.start, 1, ix.end - ix.start - 1, geom_out, geompos, "merge geometry");
+		fprintf(debug_fp, "%llu, %d\n", ix.ix, ix.minzoom);
+		serialize_byte(geom_out, ix.minzoom, geompos, "merge geometry");
+		*progress += (ix.end - ix.start) * 3 / 4;
+		if (!quiet && !quiet_progress && progress_time() && 100 * *progress / *progress_max != *progress_reported) {
+			fprintf(stderr, "Reordering geometry: %lld%% \r", 100 * *progress / *progress_max);
+			fflush(stderr);
+			*progress_reported = 100 * *progress / *progress_max;
+		}
+
+		ix.start = pos;
+		ix.end = *geompos;
+		std::atomic<long long> indexpos;
+		fwrite_check(&ix, bytes, 1, indexfile, &indexpos, "merge temporary");
+	}
+}
+
 static void merge(struct mergelist *merges, size_t nmerges, unsigned char *map, FILE *indexfile, int bytes, char *geom_map, FILE *geom_out, std::atomic<long long> *geompos, long long *progress, long long *progress_max, long long *progress_reported, int maxzoom, double gamma, struct drop_state *ds) {
 	struct mergelist *head = NULL;
 
@@ -961,7 +1038,14 @@ void radix1(int *geomfds_in, int *indexfds_in, int inputs, int prefix, int split
 				madvise(geommap, geomst.st_size, MADV_RANDOM);
 				madvise(geommap, geomst.st_size, MADV_WILLNEED);
 
-				merge(merges, nmerges, (unsigned char *) indexmap, indexfile, bytes, geommap, geomfile, geompos_out, progress, progress_max, progress_reported, maxzoom, gamma, ds);
+				if (priority_attribute == "")
+				{
+					merge(merges, nmerges, (unsigned char *) indexmap, indexfile, bytes, geommap, geomfile, geompos_out, progress, progress_max, progress_reported, maxzoom, gamma, ds);
+				}
+				else
+				{
+					merge_with_priority(merges, nmerges, (unsigned char *) indexmap, indexfile, bytes, geommap, geomfile, geompos_out, progress, progress_max, progress_reported, maxzoom, gamma, ds);
+				}
 
 				madvise(indexmap, indexst.st_size, MADV_DONTNEED);
 				if (munmap(indexmap, indexst.st_size) < 0) {
